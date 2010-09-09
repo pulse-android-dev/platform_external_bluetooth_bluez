@@ -673,6 +673,7 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 	struct a2dp_data *a2dp = &client->d.a2dp;
 	uint16_t imtu, omtu;
 	GSList *caps;
+	struct avdtp_service_capability *protection;
 
 	client->req_id = 0;
 
@@ -703,6 +704,19 @@ static void a2dp_config_complete(struct avdtp *session, struct a2dp_sep *sep,
 
 	/* FIXME: Use imtu when fd_opt is CFG_FD_OPT_READ */
 	rsp->link_mtu = omtu;
+
+	protection = avdtp_get_protection(stream);
+
+	/* Initialize to Zero */
+	rsp->content_protection = 0;
+
+	if (protection != NULL) {
+		if (protection->length >= 2) {
+			struct avdtp_content_protection_capability *prot = (void *)protection->data;
+
+			rsp->content_protection = (prot->cp_type_msb << 8) | prot->cp_type_lsb;
+		}
+	}
 
 	unix_ipc_sendmsg(client, &rsp->h);
 

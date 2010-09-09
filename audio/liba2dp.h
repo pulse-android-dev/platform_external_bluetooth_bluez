@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2007  Nokia Corporation
  *  Copyright (C) 2004-2008  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -30,6 +31,7 @@ typedef void* a2dpData;
 
 int a2dp_init(int rate, int channels, a2dpData* dataPtr);
 void a2dp_set_sink(a2dpData data, const char* address);
+void a2dp_set_cp_header(a2dpData data, uint8_t cpHeader);
 int a2dp_write(a2dpData data, const void* buffer, int count);
 int a2dp_stop(a2dpData data);
 void a2dp_cleanup(a2dpData data);

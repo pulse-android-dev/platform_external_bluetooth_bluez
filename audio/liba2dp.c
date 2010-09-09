@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2007  Nokia Corporation
  *  Copyright (C) 2004-2008  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved.
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -47,27 +48,29 @@
 #include "rtp.h"
 #include "liba2dp.h"
 
-#define LOG_NDEBUG 0
-#define LOG_TAG "A2DP"
-#include <utils/Log.h>
-
-#define ENABLE_DEBUG
-/* #define ENABLE_VERBOSE */
-/* #define ENABLE_TIMING */
-
 #define BUFFER_SIZE 2048
 
+#ifdef ENABLE_TIMING
+#define ENABLE_DEBUG
+#define ENABLE_VERBOSE
+#endif
+
 #ifdef ENABLE_DEBUG
+#define LOG_NDDEBUG 0
 #define DBG LOGD
 #else
 #define DBG(fmt, arg...)
 #endif
 
 #ifdef ENABLE_VERBOSE
+#define LOG_NDEBUG 0
 #define VDBG LOGV
 #else
 #define VDBG(fmt, arg...)
 #endif
+
+#define LOG_TAG "A2DP"
+#include <utils/Log.h>
 
 #ifndef MIN
 # define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -136,6 +139,8 @@ struct bluetooth_data {
 	int	frame_duration;			/* length of an SBC frame in microseconds */
 	int codesize;				/* SBC codesize */
 	int samples;				/* Number of encoded samples */
+	size_t sizeof_scms_t;                   /* Indicates protection hdr */
+	uint8_t scms_t_cp_header;		/* Protection header to use */
 	uint8_t buffer[BUFFER_SIZE];		/* Codec transfer buffer */
 	int count;				/* Codec transfer buffer counter */
 
@@ -150,6 +155,10 @@ struct bluetooth_data {
 	/* used for pacing our writes to the output socket */
 	uint64_t	next_write;
 };
+
+#define CP_TYPE_SCMS_T 		0x0002
+#define SCMS_T_COPY_ALLOWED	0x00
+#define SCMS_T_COPY_NOT_ALLOWED 0x02
 
 static uint64_t get_microseconds()
 {
@@ -259,7 +268,7 @@ static int bluetooth_start(struct bluetooth_data *data)
 	setsockopt(data->stream.fd, SOL_SOCKET, SO_SNDBUF, &bytes,
 			sizeof(bytes));
 
-	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
+	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload) + data->sizeof_scms_t;
 	data->frame_count = 0;
 	data->samples = 0;
 	data->nsamples = 0;
@@ -621,7 +630,14 @@ static int bluetooth_a2dp_hw_params(struct bluetooth_data *data)
 		return err;
 
 	data->link_mtu = setconf_rsp->link_mtu;
-	DBG("MTU: %d", data->link_mtu);
+	if (setconf_rsp->content_protection == CP_TYPE_SCMS_T) {
+		data->sizeof_scms_t = 1;
+		data->scms_t_cp_header = SCMS_T_COPY_NOT_ALLOWED;
+	} else {
+		data->sizeof_scms_t = 0;
+		data->scms_t_cp_header = SCMS_T_COPY_ALLOWED;
+	}
+	DBG("MTU: %d -- SCMS-T Enabled: %d", data->link_mtu, setconf_rsp->content_protection);
 
 	/* Setup SBC encoder now we agree on parameters */
 	bluetooth_a2dp_setup(data);
@@ -647,10 +663,13 @@ static int avdtp_write(struct bluetooth_data *data)
 #endif
 
 	header = (struct rtp_header *)data->buffer;
-	payload = (struct rtp_payload *)(data->buffer + sizeof(*header));
+	payload = (struct rtp_payload *)(data->buffer + sizeof(*header) + data->sizeof_scms_t);
 
-	memset(data->buffer, 0, sizeof(*header) + sizeof(*payload));
+	memset(data->buffer, 0, sizeof(*header) + sizeof(*payload) + data->sizeof_scms_t);
 
+	if (data->sizeof_scms_t) {
+		data->buffer[sizeof(*header)] = data->scms_t_cp_header;
+	}
 	payload->frame_count = data->frame_count;
 	header->v = 2;
 	header->pt = 1;
@@ -667,30 +686,30 @@ static int avdtp_write(struct bluetooth_data *data)
 	end2 = get_microseconds();
 	print_time("poll", begin2, end2);
 #endif
-	if (ret == 1 && data->stream.revents == POLLOUT) {
-		long ahead = 0;
-		now = get_microseconds();
+	long ahead = 0;
+	now = get_microseconds();
 
-		if (data->next_write) {
-			ahead = data->next_write - now;
+	if (data->next_write) {
+		ahead = data->next_write - now;
 #ifdef ENABLE_TIMING
-			DBG("duration: %ld, ahead: %ld", duration, ahead);
+		DBG("duration: %ld, ahead: %ld", duration, ahead);
 #endif
-			if (ahead > 0) {
-				/* too fast, need to throttle */
-				usleep(ahead);
-			}
-		} else {
-			data->next_write = now;
+		if (ahead > 0) {
+			/* too fast, need to throttle */
+			usleep(ahead);
 		}
-		if (ahead <= -CATCH_UP_TIMEOUT * 1000) {
-			/* fallen too far behind, don't try to catch up */
-			VDBG("ahead < %d, reseting next_write timestamp", -CATCH_UP_TIMEOUT * 1000);
-			data->next_write = 0;
-		} else {
-			data->next_write += duration;
-		}
+	} else {
+		data->next_write = now;
+	}
+	if (ahead <= -CATCH_UP_TIMEOUT * 1000) {
+		/* fallen too far behind, don't try to catch up */
+		VDBG("ahead < %d, reseting next_write timestamp", -CATCH_UP_TIMEOUT * 1000);
+		data->next_write = 0;
+	} else {
+		data->next_write += duration;
+	}
 
+	if (ret == 1 && data->stream.revents == POLLOUT) {
 #ifdef ENABLE_TIMING
 		begin2 = get_microseconds();
 #endif
@@ -710,11 +729,10 @@ static int avdtp_write(struct bluetooth_data *data)
 		/* can happen during normal remote disconnect */
 		VDBG("poll() failed: %d (revents = %d, errno %s)",
 				ret, data->stream.revents, strerror(errno));
-		data->next_write = 0;
 	}
 
 	/* Reset buffer of data to send */
-	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
+	data->count = sizeof(struct rtp_header) + sizeof(struct rtp_payload) + data->sizeof_scms_t;
 	data->frame_count = 0;
 	data->samples = 0;
 	data->seq_num++;
@@ -1173,6 +1191,18 @@ void a2dp_set_sink(a2dpData d, const char* address)
 	}
 }
 
+void a2dp_set_cp_header(a2dpData d, uint8_t cpHeader)
+{
+	struct bluetooth_data* data = (struct bluetooth_data*)d;
+
+	if (data) {
+		VDBG("a2dp_set_cp_header called.  current: %x, new: %x", data->scms_t_cp_header, cpHeader);
+
+		/* For SCMS-T least significant two bits matter, mask out the rest */
+		data->scms_t_cp_header = (cpHeader & 0x03);
+	}
+}
+
 int a2dp_write(a2dpData d, const void* buffer, int count)
 {
 	struct bluetooth_data* data = (struct bluetooth_data*)d;
@@ -1213,7 +1243,7 @@ int a2dp_write(a2dpData d, const void* buffer, int count)
 		data->count += written;
 		data->frame_count++;
 		data->samples += encoded;
-		data->nsamples += encoded;
+		data->nsamples += encoded/4;
 
 		/* No space left for another frame then send */
 		if ((data->count + written >= data->link_mtu) ||

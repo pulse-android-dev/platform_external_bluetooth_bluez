@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 2006-2007  Nokia Corporation
  *  Copyright (C) 2004-2009  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2010, Code Aurora Forum. All rights reserved.
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -78,6 +79,7 @@
 #define AVDTP_PKT_TYPE_END			0x03
 
 #define AVDTP_MSG_TYPE_COMMAND			0x00
+#define AVDTP_MSG_TYPE_GEN_REJECT		0x01
 #define AVDTP_MSG_TYPE_ACCEPT			0x02
 #define AVDTP_MSG_TYPE_REJECT			0x03
 
@@ -300,6 +302,7 @@ struct avdtp_remote_sep {
 	uint8_t type;
 	uint8_t media_type;
 	struct avdtp_service_capability *codec;
+	struct avdtp_service_capability *protection;
 	GSList *caps; /* of type struct avdtp_service_capability */
 	struct avdtp_stream *stream;
 };
@@ -345,6 +348,7 @@ struct avdtp_stream {
 	GSList *caps;
 	GSList *callbacks;
 	struct avdtp_service_capability *codec;
+	struct avdtp_service_capability *protection;
 	guint io_id;		/* Transport GSource ID */
 	guint timer;		/* Waiting for other side to close or open
 				 * the transport channel */
@@ -1112,11 +1116,13 @@ static struct avdtp_local_sep *find_local_sep(struct avdtp_server *server,
 }
 
 static GSList *caps_to_list(uint8_t *data, int size,
-				struct avdtp_service_capability **codec)
+				struct avdtp_service_capability **codec,
+				struct avdtp_service_capability **protection)
 {
 	GSList *caps;
 	int processed;
 
+	*protection = NULL;
 	for (processed = 0, caps = NULL; processed + 2 < size;) {
 		struct avdtp_service_capability *cap;
 		uint8_t length, category;
@@ -1142,16 +1148,21 @@ static GSList *caps_to_list(uint8_t *data, int size,
 				length >=
 				sizeof(struct avdtp_media_codec_capability))
 			*codec = cap;
+
+		else if (category == AVDTP_CONTENT_PROTECTION &&
+				length >=
+				sizeof(struct avdtp_content_protection_capability))
+			*protection = cap;
 	}
 
 	return caps;
 }
 
 static gboolean avdtp_unknown_cmd(struct avdtp *session, uint8_t transaction,
-							void *buf, int size)
+							uint8_t signal_id)
 {
-	return avdtp_send(session, transaction, AVDTP_MSG_TYPE_REJECT,
-								0, NULL, 0);
+	return avdtp_send(session, transaction, AVDTP_MSG_TYPE_GEN_REJECT,
+							signal_id, NULL, 0);
 }
 
 static gboolean avdtp_discover_cmd(struct avdtp *session, uint8_t transaction,
@@ -1288,7 +1299,7 @@ static gboolean avdtp_setconf_cmd(struct avdtp *session, uint8_t transaction,
 	stream->rseid = req->int_seid;
 	stream->caps = caps_to_list(req->caps,
 					size - sizeof(struct setconf_req),
-					&stream->codec);
+					&stream->codec, &stream->protection);
 
 	/* Verify that the Media Transport capability's length = 0. Reject otherwise */
 	for (l = stream->caps; l != NULL; l = g_slist_next(l)) {
@@ -1379,7 +1390,7 @@ failed:
 static gboolean avdtp_reconf_cmd(struct avdtp *session, uint8_t transaction,
 					struct seid_req *req, int size)
 {
-	return avdtp_unknown_cmd(session, transaction, (void *) req, size);
+	return avdtp_unknown_cmd(session, transaction, AVDTP_RECONFIGURE);
 }
 
 static gboolean avdtp_open_cmd(struct avdtp *session, uint8_t transaction,
@@ -1630,7 +1641,7 @@ failed:
 static gboolean avdtp_secctl_cmd(struct avdtp *session, uint8_t transaction,
 					struct seid_req *req, int size)
 {
-	return avdtp_unknown_cmd(session, transaction, (void *) req, size);
+	return avdtp_unknown_cmd(session, transaction, AVDTP_SECURITY_CONTROL);
 }
 
 static gboolean avdtp_parse_cmd(struct avdtp *session, uint8_t transaction,
@@ -1672,7 +1683,7 @@ static gboolean avdtp_parse_cmd(struct avdtp *session, uint8_t transaction,
 		return avdtp_secctl_cmd(session, transaction, buf, size);
 	default:
 		debug("Received unknown request id %u", signal_id);
-		return avdtp_unknown_cmd(session, transaction, buf, size);
+		return avdtp_unknown_cmd(session, transaction, signal_id);
 	}
 }
 
@@ -1894,6 +1905,9 @@ static gboolean session_cb(GIOChannel *chan, GIOCondition cond,
 			error("Unable to parse reject response");
 			goto failed;
 		}
+		break;
+	case AVDTP_MSG_TYPE_GEN_REJECT:
+		error("Received a General Reject message");
 		break;
 	default:
 		error("Unknown message type 0x%02X", header->message_type);
@@ -2439,10 +2453,11 @@ static gboolean avdtp_get_capabilities_resp(struct avdtp *session,
 		g_slist_free(sep->caps);
 		sep->caps = NULL;
 		sep->codec = NULL;
+		sep->protection = NULL;
 	}
 
 	sep->caps = caps_to_list(resp->caps, size - sizeof(struct getcap_resp),
-					&sep->codec);
+					&sep->codec, &sep->protection);
 
 	return TRUE;
 }
@@ -2892,6 +2907,22 @@ struct avdtp_service_capability *avdtp_get_codec(struct avdtp_remote_sep *sep)
 	return sep->codec;
 }
 
+struct avdtp_service_capability *avdtp_get_protection(struct avdtp_stream *stream)
+{
+	if (stream) {
+		return stream->protection;
+	}
+	return NULL;
+}
+
+struct avdtp_service_capability *avdtp_get_remote_sep_protection(struct avdtp_remote_sep *sep)
+{
+	if (sep) {
+		return sep->protection;
+	}
+	return NULL;
+}
+
 struct avdtp_stream *avdtp_get_stream(struct avdtp_remote_sep *sep)
 {
 	return sep->stream;
@@ -3085,6 +3116,7 @@ int avdtp_set_configuration(struct avdtp *session,
 	new_stream->session = session;
 	new_stream->lsep = lsep;
 	new_stream->rseid = rsep->seid;
+	new_stream->protection = NULL;
 
 	g_slist_foreach(caps, copy_capabilities, &new_stream->caps);
 
@@ -3104,6 +3136,9 @@ int avdtp_set_configuration(struct avdtp *session,
 		cap = l->data;
 		memcpy(ptr, cap, cap->length + 2);
 		ptr += cap->length + 2;
+		if (cap->category == AVDTP_CONTENT_PROTECTION) {
+			new_stream->protection = cap;
+		}
 	}
 
 	ret = send_request(session, FALSE, new_stream,
